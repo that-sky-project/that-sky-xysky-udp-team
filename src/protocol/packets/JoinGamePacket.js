@@ -64,8 +64,8 @@ export class JoinGamePacket {
     const moving = Boolean(reader.readUInt8());
     const hasTransferAddress = Boolean(reader.readUInt8());
     const mergeState = reader.readUInt8();
-    const transferAddress = NetAddress.decode(reader);
-    const moveResult = reader.readUInt32();
+    const transferAddress = reader.remaining >= 6 ? NetAddress.decode(reader) : null;
+    const moveResult = reader.remaining >= 4 ? reader.readUInt32() : 0;
 
     return {
       uuid,

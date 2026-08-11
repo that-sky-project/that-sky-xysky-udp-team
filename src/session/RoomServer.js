@@ -121,7 +121,7 @@ export class RoomServer {
     this.logger.debug({ peerId: peerId.toString(), sessionId: session.id }, 'peer connected');
   }
 
-  onPeerMessage(peerId, data) {
+  onPeerMessage(peerId, data, channel = 0) {
     const session = this.sessions.get(peerId);
     if (!session || session.closed) {
       return;
@@ -139,6 +139,7 @@ export class RoomServer {
     try {
       const packet = this.codec.decodeClient(data);
       this.metrics.packets.inc({ direction: 'client', type: packet.name });
+      this.logClientPacket(session, peerId, channel, data, packet);
       const endTimer = this.metrics.packetDuration.startTimer({ type: packet.name });
       try {
         this.dispatcher.dispatch(session, packet);
@@ -149,9 +150,29 @@ export class RoomServer {
       this.rejectSessionPacket(session, error.name ?? 'decode_error');
       this.logger.warn({
         err: error,
-        peerId: peerId.toString()
+        peerId: peerId.toString(),
+        sessionId: session.id,
+        channel,
+        rawPacket: formatPacketBytes(data)
       }, 'failed to process packet');
     }
+  }
+
+  logClientPacket(session, peerId, channel, data, packet) {
+    const logData = {
+      peerId: peerId.toString(),
+      sessionId: session.id,
+      channel,
+      rawPacket: formatPacketBytes(data),
+      packet: formatPacket(packet)
+    };
+
+    if (packet.id === PacketIds.JoinGame) {
+      this.logger.info(logData, 'client join packet decoded');
+      return;
+    }
+
+    this.logger.debug(logData, 'client packet decoded');
   }
 
   rejectSessionPacket(session, reason) {
@@ -311,4 +332,74 @@ export class RoomServer {
       moveHistory: this.moveService.listHistory()
     };
   }
+}
+
+function formatPacketBytes(data) {
+  const buffer = Buffer.from(data);
+  return {
+    bytes: buffer.length,
+    hex: buffer.toString('hex'),
+    base64: buffer.toString('base64'),
+    header: readClientPacketHeader(buffer)
+  };
+}
+
+function readClientPacketHeader(buffer) {
+  return {
+    token: buffer.length >= 4 ? buffer.readUInt32LE(0) : null,
+    id: buffer.length >= 5 ? buffer.readUInt8(4) : null,
+    sequence: buffer.length >= 6 ? buffer.readUInt8(5) : null,
+    payloadBytes: Math.max(0, buffer.length - 6)
+  };
+}
+
+function formatPacket(packet) {
+  return {
+    id: packet.id,
+    name: packet.name,
+    token: packet.token,
+    sequence: packet.sequence,
+    payload: sanitizeForLog(packet.payload)
+  };
+}
+
+function sanitizeForLog(value, depth = 0) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+
+  if (Buffer.isBuffer(value)) {
+    return {
+      type: 'Buffer',
+      bytes: value.length,
+      hex: value.subarray(0, 256).toString('hex'),
+      truncated: value.length > 256
+    };
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeForLog(item, depth + 1));
+  }
+
+  if (typeof value === 'object') {
+    if (depth >= 4) {
+      return '[max-depth]';
+    }
+
+    if (value.bytes && Buffer.isBuffer(value.bytes) && typeof value.toString === 'function') {
+      return value.toString();
+    }
+
+    const output = {};
+    for (const [key, item] of Object.entries(value)) {
+      output[key] = sanitizeForLog(item, depth + 1);
+    }
+    return output;
+  }
+
+  return value;
 }

@@ -5,6 +5,19 @@ export async function createHttpServer({ config, logger, room, metrics }) {
     loggerInstance: logger
   });
 
+  app.get('/', async () => ({
+    ok: true,
+    endpoints: [
+      '/health',
+      '/rooms',
+      '/players',
+      '/levels',
+      '/metrics',
+      '/move/targets',
+      '/move/pending'
+    ]
+  }));
+
   app.get('/health', async () => ({
     ok: true,
     room: room.getStatus()

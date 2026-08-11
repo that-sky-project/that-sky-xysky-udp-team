@@ -10,6 +10,7 @@ export class EnetServer extends EventEmitter {
     this.channels = channels;
     this.logger = logger;
     this.server = null;
+    this.listenTask = null;
   }
 
   async start() {
@@ -36,7 +37,24 @@ export class EnetServer extends EventEmitter {
         this.emit('error', error);
       });
 
-    await this.server.listen();
+    await new Promise((resolve, reject) => {
+      const onReady = () => {
+        this.off('error', onError);
+        resolve();
+      };
+      const onError = error => {
+        this.off('ready', onReady);
+        reject(error);
+      };
+
+      this.once('ready', onReady);
+      this.once('error', onError);
+
+      this.listenTask = this.server.listen().catch(error => {
+        this.logger.error({ err: error }, 'enet listen loop failed');
+        this.emit('error', error);
+      });
+    });
   }
 
   async stop() {
@@ -47,6 +65,7 @@ export class EnetServer extends EventEmitter {
     this.server.stop();
     this.server.destroy?.();
     this.server = null;
+    this.listenTask = null;
   }
 
   send(peerId, buffer, { channel = 0, reliable = false } = {}) {

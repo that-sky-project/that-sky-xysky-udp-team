@@ -19,7 +19,7 @@ const envSchema = z.object({
   ROOM_BAD_PACKET_LIMIT: numberFromEnv(8),
 
   HTTP_HOST: z.string().default('0.0.0.0'),
-  HTTP_PORT: numberFromEnv(8080),
+  HTTP_PORT: numberFromEnv(25565),
   MOVE_TARGETS: z.string().default('[]')
 });
 
