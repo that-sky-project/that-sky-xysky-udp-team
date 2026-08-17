@@ -28,8 +28,5 @@ function readCString(reader, maxLength) {
 }
 
 function readFloat(reader) {
-  reader.ensure(4);
-  const value = reader.buffer.readFloatLE(reader.offset);
-  reader.offset += 4;
-  return value;
+  return reader.readFloat();
 }

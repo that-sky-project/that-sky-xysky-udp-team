@@ -68,7 +68,7 @@ export class EnetServer extends EventEmitter {
     this.listenTask = null;
   }
 
-  send(peerId, buffer, { channel = 0, reliable = false } = {}) {
+  send(peerId, buffer, { channel = 0, reliable = true } = {}) {
     if (!this.server) {
       return 0;
     }

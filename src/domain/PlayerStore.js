@@ -2,11 +2,11 @@ import { Player } from './Player.js';
 import { StateError } from '../utils/errors.js';
 
 export class PlayerStore {
-  constructor({ maxPlayers }) {
-    this.maxPlayers = maxPlayers;
+  constructor() {
     this.playersById = new Map();
     this.playersBySession = new Map();
     this.playersByUuid = new Map();
+    this.netIdCount = 0;
   }
 
   get size() {
@@ -14,10 +14,6 @@ export class PlayerStore {
   }
 
   add({ session, uuid, levelId, netVersion }) {
-    if (this.playersById.size >= this.maxPlayers) {
-      throw new StateError('room is full');
-    }
-
     if (this.playersBySession.has(session.id)) {
       throw new StateError('session already has a player', { sessionId: session.id });
     }
@@ -33,13 +29,13 @@ export class PlayerStore {
   }
 
   allocateId() {
-    for (let id = 1; id < 255; id += 1) {
-      if (!this.playersById.has(id)) {
-        return id;
-      }
+    if (this.netIdCount === 0) {
+      this.netIdCount = 1;
     }
 
-    throw new StateError('no player id available');
+    const id = this.netIdCount;
+    this.netIdCount = (this.netIdCount + 1) & 0xff;
+    return id;
   }
 
   getBySession(session) {

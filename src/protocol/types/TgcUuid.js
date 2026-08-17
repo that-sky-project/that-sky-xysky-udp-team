@@ -1,7 +1,9 @@
+import { ProtocolError } from '../../utils/errors.js';
+
 export class TgcUuid {
   constructor(bytes = Buffer.alloc(16)) {
     if (bytes.length !== 16) {
-      throw new Error('TgcUuid must be 16 bytes');
+      throw new ProtocolError('TgcUuid must be 16 bytes', { length: bytes.length });
     }
 
     this.bytes = Buffer.from(bytes);

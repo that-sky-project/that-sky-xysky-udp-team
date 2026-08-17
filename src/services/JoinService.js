@@ -1,20 +1,19 @@
-import { PacketIds } from '../protocol/PacketCodec.js';
+import { PacketIds } from '../protocol/PacketIds.js';
 
 export class JoinService {
-  constructor({ players, levels, broadcaster, logger, metrics, onAuthorityChanged }) {
+  constructor({ players, levels, broadcaster, logger, metrics }) {
     this.players = players;
     this.levels = levels;
     this.broadcaster = broadcaster;
     this.logger = logger;
     this.metrics = metrics;
-    this.onAuthorityChanged = onAuthorityChanged;
   }
 
   join(session, payload) {
     const player = this.players.add({
       session,
       uuid: payload.uuid,
-      levelId: payload.levelId,
+      levelId: payload.levelId ?? 0,
       netVersion: payload.netVersion
     });
 
@@ -35,10 +34,10 @@ export class JoinService {
 
     const authority = this.levels.getAuthority(player.levelId);
     if (!authority) {
-      this.levels.setAuthority(player.levelId, player, { reason: 'join_first_player' });
-      this.onAuthorityChanged?.(player, player);
-    } else {
-      this.onAuthorityChanged?.(player, authority);
+      this.levels.setAuthority(player.levelId, player, {
+        reason: 'join_first_player',
+        notify: false
+      });
     }
 
     this.logger.info({

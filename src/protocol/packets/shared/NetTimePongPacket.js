@@ -1,4 +1,4 @@
-import { PacketIds } from '../PacketIds.js';
+import { PacketIds } from '../../PacketIds.js';
 
 export class NetTimePongPacket {
   static id = PacketIds.NetTimePong;
@@ -15,6 +15,6 @@ export class NetTimePongPacket {
   static encode(writer, packet) {
     writer.writeUInt16(packet.requestId);
     writer.writeDouble(packet.serverRecvTime);
-    writer.writeDouble(packet.serverSendTime);
+    writer.writeDouble(packet.serverSendTime ?? packet.serverRecvTime ?? 0);
   }
 }

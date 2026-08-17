@@ -1,3 +1,5 @@
+import { ProtocolError } from '../../utils/errors.js';
+
 export class NetAddress {
   constructor({ host = '127.0.0.1', port = 0 } = {}) {
     this.host = host;
@@ -18,7 +20,7 @@ export class NetAddress {
   encode(writer) {
     const parts = this.host.split('.').map(part => Number(part));
     if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) {
-      throw new Error(`invalid IPv4 address: ${this.host}`);
+      throw new ProtocolError('invalid IPv4 address', { host: this.host });
     }
 
     writer.writeUInt8(parts[0]);

@@ -1,9 +1,11 @@
-import { PacketIds } from '../PacketIds.js';
-import { decodeMusicSyncEntries } from '../types/MusicSync.js';
+import { PacketIds } from '../../PacketIds.js';
+import { decodeMusicSyncEntries } from '../../types/MusicSync.js';
 
 export const GameMsgType = Object.freeze({
   NetRpc: 2,
   PlayerStateDelta: 3,
+  Critters: 4,
+  Affinity: 7,
   NetLevelDataElect: 8,
   NetLevelDataRevoke: 9,
   NetLevelDataRevokeAck: 10,
@@ -11,6 +13,7 @@ export const GameMsgType = Object.freeze({
   NetLevelDataHeartbeat: 12,
   SnapshotAck: 14,
   MusicSync: 15,
+  Metrics: 16,
   NetLevelElectionNominee: 17
 });
 
@@ -27,7 +30,7 @@ function readSnapshotPayload(reader) {
 
 function writeHeader(writer, packet) {
   writer.writeUInt8(packet.type);
-  writer.writeUInt8(packet.levelChangeCount ?? 1);
+  writer.writeUInt8(packet.levelChangeCount ?? 0);
   writer.writeUInt8(packet.sourcePlayer ?? 0);
 }
 
@@ -69,12 +72,14 @@ export class GameMsgPacket {
 
     if (type === GameMsgType.NetLevelDataRevoke) {
       const raw = reader.readBytes(reader.remaining);
-      const parsed = raw.length >= 3
+      const parsed = raw.length >= 5
         ? {
             playerId: raw.readUInt8(0),
-            reason: raw.readUInt16LE(1)
+            levelId: raw.readUInt32LE(1)
           }
-        : {};
+        : raw.length >= 1
+          ? { playerId: raw.readUInt8(0) }
+          : {};
 
       return {
         ...base,
@@ -121,10 +126,10 @@ export class GameMsgPacket {
     }
 
     if (type === GameMsgType.NetLevelElectionNominee) {
-      if (reader.remaining >= 6) {
+      if (reader.remaining >= 3) {
         return {
           ...base,
-          playerId: reader.readUInt32(),
+          playerId: reader.readUInt8(),
           reason: reader.readUInt16()
         };
       }
@@ -166,7 +171,7 @@ export class GameMsgPacket {
       }
 
       writer.writeUInt8(packet.playerId ?? packet.authorityPlayerId ?? 0);
-      writer.writeUInt16(packet.reason ?? 0);
+      writer.writeUInt32(packet.levelId ?? 0);
       return;
     }
 
@@ -195,7 +200,7 @@ export class GameMsgPacket {
         return;
       }
 
-      writer.writeUInt32(packet.playerId ?? 0);
+      writer.writeUInt8(packet.playerId ?? 0);
       writer.writeUInt16(packet.reason ?? 0);
       return;
     }

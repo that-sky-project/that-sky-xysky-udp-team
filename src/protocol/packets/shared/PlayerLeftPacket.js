@@ -1,4 +1,4 @@
-import { PacketIds } from '../PacketIds.js';
+import { PacketIds } from '../../PacketIds.js';
 
 export class PlayerLeftPacket {
   static id = PacketIds.PlayerLeft;

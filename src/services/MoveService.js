@@ -1,4 +1,4 @@
-import { PacketIds } from '../protocol/PacketCodec.js';
+import { PacketIds } from '../protocol/PacketIds.js';
 
 export class MoveService {
   constructor({ players, rooms, broadcaster, transport, logger }) {

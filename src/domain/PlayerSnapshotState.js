@@ -3,8 +3,8 @@ import { SnapshotWriter } from '../protocol/snapshot/SnapshotWriter.js';
 
 export class PlayerSnapshotState {
   constructor() {
-    this.reader = new SnapshotReader();
-    this.writer = new SnapshotWriter();
+    this.rawState = null;
+    this.readAckSequence = undefined;
     this.stats = {
       lastReadAt: undefined,
       lastReadSequence: undefined,
@@ -19,12 +19,14 @@ export class PlayerSnapshotState {
       lastWriteStatus: undefined,
       droppedWrites: 0
     };
-    this.reader.onSync(status => {
-      this.stats.lastReadStatus = status;
-    });
-    this.writer.onSync(status => {
-      this.stats.lastWriteStatus = status;
-    });
+    this._initReaderWriter();
+  }
+
+  _initReaderWriter() {
+    this.reader = new SnapshotReader();
+    this.writer = new SnapshotWriter();
+    this.reader.onSync(status => { this.stats.lastReadStatus = status; });
+    this.writer.onSync(status => { this.stats.lastWriteStatus = status; });
   }
 
   read(snapshot, payload) {
@@ -34,15 +36,28 @@ export class PlayerSnapshotState {
     this.stats.lastReadPayloadBytes = payload?.length ?? 0;
     this.stats.lastReadDataBytes = result.ok ? result.data.length : 0;
     this.stats.lastReadError = result.ok ? undefined : result.reason;
+    if (result.ok) {
+      this.rawState = result.data;
+      if (result.ack) {
+        this.readAckSequence = result.ack;
+      }
+    }
     return result;
   }
 
   write(data) {
-    const frame = this.writer.write(data);
-    if (!frame) {
+    const frameBuf = this.writer.write(data);
+    if (!frameBuf) {
       this.stats.droppedWrites += 1;
       return undefined;
     }
+
+    const frame = {
+      sequence: frameBuf[0],
+      base:     frameBuf[1],
+      checksum: frameBuf[2],
+      payload:  frameBuf.subarray(3)
+    };
 
     this.stats.lastWriteAt = Date.now();
     this.stats.lastWriteSequence = frame.sequence;
@@ -60,8 +75,6 @@ export class PlayerSnapshotState {
   }
 
   reset() {
-    this.reader = new SnapshotReader();
-    this.writer = new SnapshotWriter();
     this.stats.lastReadAt = undefined;
     this.stats.lastReadSequence = undefined;
     this.stats.lastReadPayloadBytes = 0;
@@ -74,15 +87,12 @@ export class PlayerSnapshotState {
     this.stats.lastWriteDataBytes = 0;
     this.stats.lastWriteStatus = 'reset';
     this.stats.droppedWrites = 0;
-    this.reader.onSync(status => {
-      this.stats.lastReadStatus = status;
-    });
-    this.writer.onSync(status => {
-      this.stats.lastWriteStatus = status;
-    });
+    this.rawState = null;
+    this.readAckSequence = undefined;
+    this._initReaderWriter();
   }
 
   toApi() {
-    return { ...this.stats };
+    return { ...this.stats, readAckSequence: this.readAckSequence };
   }
 }

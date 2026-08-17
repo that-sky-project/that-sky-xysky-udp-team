@@ -1,4 +1,4 @@
-import { PacketIds } from '../PacketIds.js';
+import { PacketIds } from '../../PacketIds.js';
 
 export class NetTimePingPacket {
   static id = PacketIds.NetTimePing;

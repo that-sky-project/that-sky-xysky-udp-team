@@ -8,9 +8,22 @@ export class ConnectionSession {
     this.connectedAt = Date.now();
     this.lastPacketAt = this.connectedAt;
     this.player = null;
-    this.joinTimer = null;
     this.closed = false;
     this.badPackets = 0;
+    this._sessionSeq = 0;
+    this._packetSeq = new Map();
+  }
+
+  /**
+   * Allocate the next session_seq and packet_seq for packet type `typeId`.
+   * Returns { sessionSeq: u32, packetSeq: u08 } for the outbound header.
+   */
+  nextOutboundSeq(typeId) {
+    this._sessionSeq = (this._sessionSeq + 1) >>> 0;
+    const prev = this._packetSeq.get(typeId) ?? 0;
+    const seq = (prev + 1) & 0xff;
+    this._packetSeq.set(typeId, seq);
+    return { sessionSeq: this._sessionSeq, packetSeq: seq };
   }
 
   markPacket(now = Date.now()) {
@@ -23,10 +36,6 @@ export class ConnectionSession {
 
   close() {
     this.closed = true;
-    if (this.joinTimer) {
-      clearTimeout(this.joinTimer);
-      this.joinTimer = null;
-    }
   }
 
   registerBadPacket() {

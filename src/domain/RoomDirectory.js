@@ -23,6 +23,10 @@ export class RoomDirectory {
     return this.rooms.delete(String(id));
   }
 
+  getById(id) {
+    return this.rooms.get(String(id));
+  }
+
   findTarget({ levelId, excludeRoomId } = {}) {
     const rooms = Array.from(this.rooms.values())
       .filter(room => room.id !== String(excludeRoomId ?? ''))

@@ -1,4 +1,4 @@
-import { PacketIds } from '../PacketIds.js';
+import { PacketIds } from '../../PacketIds.js';
 
 export class CancelMovePacket {
   static id = PacketIds.CancelMove;

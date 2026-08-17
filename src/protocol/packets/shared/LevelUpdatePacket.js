@@ -1,5 +1,5 @@
-import { PacketIds } from '../PacketIds.js';
-import { NetVersion } from '../types/NetVersion.js';
+import { PacketIds } from '../../PacketIds.js';
+import { NetVersion } from '../../types/NetVersion.js';
 
 export class LevelUpdatePacket {
   static id = PacketIds.LevelUpdate;
@@ -20,7 +20,7 @@ export class LevelUpdatePacket {
     writer.writeUInt8(packet.levelChangeCount ?? 0);
     const netVersion = packet.netVersion instanceof NetVersion
       ? packet.netVersion
-      : new NetVersion(packet.netVersion?.values ?? packet.netVersion ?? []);
+      : new NetVersion(Array.isArray(packet.netVersion) ? packet.netVersion : packet.netVersion?.values ?? []);
     netVersion.encode(writer);
     writer.writeUInt8(packet.levelStatus ?? packet.unknown2 ?? 0);
     writer.writeUInt32(packet.levelId);

@@ -58,6 +58,13 @@ export class BinaryReader {
     return value;
   }
 
+  readFloat() {
+    this.ensure(4);
+    const value = this.buffer.readFloatLE(this.offset);
+    this.offset += 4;
+    return value;
+  }
+
   readBytes(size) {
     this.ensure(size);
     const value = this.buffer.subarray(this.offset, this.offset + size);
