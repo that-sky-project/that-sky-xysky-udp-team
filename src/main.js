@@ -1,10 +1,10 @@
-import { loadConfig } from './config/env.js';
+import { loadConfig } from './config/index.js';
 import { createLogger } from './observability/logger.js';
 import { createHttpServer } from './api/httpServer.js';
 import { RoomServer } from './session/RoomServer.js';
 import { createMetrics } from './observability/metrics.js';
 
-const config = loadConfig(process.env);
+const config = loadConfig();
 const logger = createLogger(config.logging);
 const metrics = createMetrics();
 

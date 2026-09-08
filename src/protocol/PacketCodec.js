@@ -35,7 +35,15 @@ export class PacketCodec {
     packetType.encode(payloadWriter, packet.payload ?? {}, { fromServer: true });
 
     const payload = payloadWriter.toBuffer();
+    if (payload.length > 0xffff) {
+      throw new ProtocolError('server packet payload too large', {
+        id: packet.id,
+        length: payload.length,
+        max: 0xffff
+      });
+    }
 
+    // Application-layer S→C header: [packet_id: u08][payload_length: u16 LE]
     const writer = new BinaryWriter(3 + payload.length);
     writer.writeUInt8(packet.id);
     writer.writeUInt16(payload.length);

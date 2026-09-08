@@ -2,13 +2,24 @@ import { fnv1a8 } from './fnv1a.js';
 import { Snapshot } from './Snapshot.js';
 import { SNAPSHOT_MAX_DATA_BYTES } from './constants.js';
 
+// Wire frame layout (matches Rust colorsky SnapshotReader):
+//   [save_seq: u8][base_seq: u8][checksum: u8][payload...]
+//
+// Frame types:
+//   raw:      save_seq != 0, base_seq == 0  — full raw state, stored in window
+//   keyframe: save_seq != 0, base_seq != 0  — XOR-RLE diff, stored in window
+//   delta:    save_seq == 0, base_seq != 0  — XOR-RLE diff, NOT stored in window
+//   invalid:  save_seq == 0, base_seq == 0  — ignored
 
 const MAX_WINDOW = 16;
 
 export class SnapshotReader {
   constructor({ baseSize = SNAPSHOT_MAX_DATA_BYTES } = {}) {
     this.baseSize = baseSize;
-    this.window = [];
+    // Native Initialize seeds an empty sequence-1 base. This lets the first
+    // wire frame be a saved delta with save_seq 2 and base_seq 1.
+    // Entries are ordered oldest-first.
+    this.window = [{ sequence: 1, data: Buffer.alloc(0) }];
     this.waitingForKeyframe = false;
     this.onStatus = undefined;
   }
@@ -38,6 +49,7 @@ export class SnapshotReader {
    * or { ok: false, reason: string } on failure.
    */
   read(frameOrObj) {
+    // Accept either a raw Buffer frame or the object form { sequence, base, checksum, payload }
     let saveSeq, baseSeq, checksum, payload;
 
     if (Buffer.isBuffer(frameOrObj)) {
@@ -49,6 +61,7 @@ export class SnapshotReader {
       checksum = frameOrObj[2];
       payload  = frameOrObj.subarray(3);
     } else {
+      // Object form from GameMsgPacket decoder: { sequence, base, checksum, payload }
       saveSeq  = frameOrObj.sequence ?? 0;
       baseSeq  = frameOrObj.base ?? 0;
       checksum = frameOrObj.checksum;
@@ -58,6 +71,7 @@ export class SnapshotReader {
       }
     }
 
+    // Invalid: both zero
     if (saveSeq === 0 && baseSeq === 0) {
       return { ok: false, reason: 'invalid_frame' };
     }
@@ -67,25 +81,34 @@ export class SnapshotReader {
       return { ok: false, reason: 'checksum' };
     }
 
+    // ── Raw frame: save_seq != 0, base_seq == 0 ──────────────────────
     if (baseSeq === 0 && saveSeq !== 0) {
       if (payload.length > this.baseSize) {
         return { ok: false, reason: 'snapshot_oversize' };
       }
+      const recovering = this.waitingForKeyframe;
       const data = Buffer.from(payload);
       this.window = [];
       this._addToWindow(saveSeq, data);
       this.waitingForKeyframe = false;
-      this.onStatus?.('resyncsuccess');
+      if (recovering) this.onStatus?.('resyncsuccess');
       return { ok: true, data, ack: saveSeq, raw: true };
     }
 
+    // ── Key or delta frame: base_seq != 0 ────────────────────────────
     if (this.waitingForKeyframe && saveSeq === 0) {
+      // delta while waiting for keyframe — ignore
       return { ok: false, reason: 'resyncing' };
     }
 
     const baseEntry = this.window.find(e => e.sequence === baseSeq);
-    if (!baseEntry && !this.waitingForKeyframe) {
-      this.onStatus?.('nokeyframe');
+    if (!baseEntry) {
+      const wasWaiting = this.waitingForKeyframe;
+      if (!wasWaiting) this.onStatus?.('nokeyframe');
+      this.window = [];
+      this.waitingForKeyframe = true;
+      if (!wasWaiting) this.onStatus?.('resyncstart');
+      return { ok: false, reason: 'missing_base' };
     }
 
     const decoded = _rleDecode(payload);
@@ -96,6 +119,7 @@ export class SnapshotReader {
       return { ok: false, reason: 'snapshot_oversize' };
     }
 
+    // The base is present here; missing bases were rejected above and require a raw/keyframe.
     const base = baseEntry ? baseEntry.data : Buffer.alloc(0);
     const outLen = decoded.length;
     const newState = Buffer.alloc(outLen);
@@ -105,8 +129,11 @@ export class SnapshotReader {
     if (outLen > base.length) decoded.copy(newState, base.length, base.length);
 
     if (saveSeq !== 0) {
+      // Keyframe: store in window
+      const recovering = this.waitingForKeyframe;
       this._addToWindow(saveSeq, newState);
       this.waitingForKeyframe = false;
+      if (recovering) this.onStatus?.('resyncsuccess');
     }
 
     return { ok: true, data: newState, ack: saveSeq !== 0 ? saveSeq : 0, raw: false };
@@ -116,7 +143,7 @@ export class SnapshotReader {
     this.window = this.window.filter(e => e.sequence !== sequence);
     this.window.push({ sequence, data: Buffer.from(data) });
     while (this.window.length > MAX_WINDOW) {
-      this.window.shift();
+      this.window.shift(); // evict oldest
     }
   }
 }
@@ -126,8 +153,9 @@ function _rleDecode(data) {
   let i = 0;
   while (i < data.length) {
     if (data[i] === 0x00) {
-      if (i + 1 >= data.length) return null;
+      if (i + 1 >= data.length) return null; // truncated
       const count = data[i + 1];
+      if (count === 0) return null;
       for (let k = 0; k < count; k++) out.push(0);
       i += 2;
     } else {

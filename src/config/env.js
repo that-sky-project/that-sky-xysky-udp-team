@@ -1,15 +1,21 @@
 import { z } from 'zod';
 
 const numberFromEnv = (fallback) => z.coerce.number().int().positive().default(fallback);
+const booleanFromEnv = (fallback) => z.preprocess(value => {
+  if (typeof value !== 'string') return value;
+  if (value.toLowerCase() === 'true' || value === '1') return true;
+  if (value.toLowerCase() === 'false' || value === '0') return false;
+  return value;
+}, z.boolean().default(fallback));
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.string().default('info'),
-  LOG_PRETTY: z.coerce.boolean().default(false),
+  LOG_PRETTY: booleanFromEnv(false),
 
   ROOM_ID: z.string().default('main'),
   ROOM_HOST: z.string().default('0.0.0.0'),
-  ROOM_PORT: numberFromEnv(25565),
+  ROOM_PORT: numberFromEnv(19132),
   ROOM_MAX_PEERS: numberFromEnv(64),
   ROOM_CHANNELS: numberFromEnv(2),
   ROOM_TICK_RATE: numberFromEnv(10),
@@ -17,7 +23,7 @@ const envSchema = z.object({
   ROOM_BAD_PACKET_LIMIT: numberFromEnv(8),
 
   HTTP_HOST: z.string().default('0.0.0.0'),
-  HTTP_PORT: numberFromEnv(25565),
+  HTTP_PORT: numberFromEnv(19132),
   MOVE_TARGETS: z.string().default('[]')
 });
 
@@ -51,8 +57,9 @@ export function loadConfig(env) {
 function parseMoveTargets(value) {
   try {
     const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+    if (!Array.isArray(parsed)) throw new Error('MOVE_TARGETS must be a JSON array');
+    return parsed;
+  } catch (error) {
+    throw new Error(`invalid MOVE_TARGETS: ${error.message}`);
   }
 }

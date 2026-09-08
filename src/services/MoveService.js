@@ -1,18 +1,21 @@
 import { PacketIds } from '../protocol/PacketIds.js';
+import { ConnectionState } from '../session/ConnectionSession.js';
 
 export class MoveService {
-  constructor({ players, rooms, broadcaster, transport, logger }) {
+  constructor({ players, rooms, broadcaster, transport, levelService, logger, onMoveResult }) {
     this.players = players;
     this.rooms = rooms;
     this.broadcaster = broadcaster;
     this.transport = transport;
+    this.levelService = levelService;
     this.logger = logger;
+    this.onMoveResult = onMoveResult;
     this.pendingMoves = new Map();
     this.moveHistory = new Map();
   }
 
   movePlayer(player, targetRoom, { disconnect = true } = {}) {
-    if (!player || !targetRoom) {
+    if (!player || !targetRoom || !player.session?.isActive?.() || this.findPendingByPlayer(player.id)) {
       return false;
     }
 
@@ -31,15 +34,24 @@ export class MoveService {
       createdAt: Date.now()
     });
 
-    this.broadcaster.send(player.session, {
-      id: PacketIds.MoveGame,
-      payload: {
-        address: targetRoom.address,
-        players: [player],
-        moveNonce,
-        splitType: 0
-      }
-    });
+    try {
+      this.broadcaster.send(player.session, {
+        id: PacketIds.MoveGame,
+        payload: {
+          address: targetRoom.address,
+          players: [player],
+          moveNonce,
+          splitType: 0,
+          isSplit: false,
+          destinationUuid: targetRoom.uuid
+        }
+      });
+    } catch (error) {
+      this.pendingMoves.delete(moveId);
+      throw error;
+    }
+    player.session.transition(ConnectionState.MOVING);
+    this.levelService?.releaseAuthority(player, 'player_moving');
 
     this.logger.info({
       playerId: player.id,
@@ -47,15 +59,108 @@ export class MoveService {
       target: targetRoom.address.toApi()
     }, 'player move requested');
 
-    if (disconnect) {
-      this.transport.disconnect(player.session.peerId, 'later', 2);
-    }
-
+    // The client owns the old UDP connection lifecycle after MoveGame. The
+    // server keeps the session in MOVING until the client's actual disconnect,
+    // which lets the target JoinGame complete without a forced server kick.
+    // if (disconnect) {
+    //   this.transport.disconnect(player.session.peerId, 'later', 2);
+    //}
     return true;
   }
 
+  movePlayersAtomic(players, targetRoom, { disconnect = true, moveId } = {}) {
+    const group = Array.isArray(players) ? players : [];
+    if (!group.length || !targetRoom) return { accepted: false, moved: 0, reason: 'empty_group' };
+    if (group.length > 7) return { accepted: false, moved: 0, reason: 'move_group_too_large' };
+    const unique = [...new Set(group)];
+    if (unique.length !== group.length) return { accepted: false, moved: 0, reason: 'duplicate_players' };
+    const eligible = unique.filter(player => player?.session?.isActive?.() && !this.findPendingByPlayer(player.id));
+    if (!eligible.length) return { accepted: false, moved: 0, reason: 'group_not_movable' };
+    const rejected = unique.filter(player => !eligible.includes(player));
+    const moved = [];
+    const failed = [...rejected];
+    const groupPlayers = eligible;
+    const prepared = [];
+    try {
+      for (const player of eligible) {
+        const pending = this.prepareMove(player, targetRoom, moveId);
+        this.pendingMoves.set(pending.moveId, pending);
+        prepared.push(pending);
+      }
+      // Every moving client receives the same complete group list. The native
+      // split flow is transactional: a partial publication would leave some
+      // clients with a roster that can never be completed at the destination.
+      for (const player of eligible) {
+        const pending = prepared.find(item => item.playerId === player.id);
+        if (!pending) continue;
+        this.broadcaster.send(player.session, {
+          id: PacketIds.MoveGame,
+          payload: {
+            address: targetRoom.address,
+            players: groupPlayers,
+            moveNonce: pending.moveNonce,
+            splitType: 0,
+            isSplit: true,
+            destinationUuid: targetRoom.uuid
+          }
+        });
+        moved.push(player);
+      }
+    } catch (error) {
+      for (const pending of prepared) {
+        this.pendingMoves.delete(pending.moveId);
+        this.moveHistory.set(pending.moveId, {
+          ...pending,
+          status: 'cancelled',
+          cancelReason: 2,
+          cancelledAt: Date.now(),
+          error: error.message
+        });
+      }
+      for (const player of moved) {
+        try {
+          this.broadcaster.send(player.session, { id: PacketIds.CancelMove, payload: { reason: 2 } });
+        } catch {
+          // The original MoveGame may already have closed the peer.
+        }
+      }
+      return { accepted: false, moved: 0, failedPlayerIds: eligible.map(player => player.uuid?.toString?.()).filter(Boolean), reason: error.message };
+    }
+    for (const player of moved) {
+      player.session.transition(ConnectionState.MOVING);
+      this.levelService?.releaseAuthority(player, 'players_moving');
+    }
+    // if (disconnect) for (const player of moved) this.transport.disconnect(player.session.peerId, 'later', 2);
+    // Do not force-disconnect the source peers. Each client closes its old
+    // connection after processing MoveGame; PeerEventHandler then emits the
+    // authoritative player.leave event.
+    this.logger.info({ moveId, playerIds: moved.map(player => player.id), targetRoomId: targetRoom.id }, 'atomic player move committed');
+    return { accepted: moved.length > 0, moved: moved.length, failedPlayerIds: failed.map(player => player.uuid?.toString?.()).filter(Boolean), movedPlayerIds: moved.map(player => player.uuid?.toString?.()).filter(Boolean) };
+  }
+
+  prepareMove(player, targetRoom, moveId) {
+    const generatedMoveId = moveId
+      ? `${moveId}:${player.id}`
+      : this.createMoveId(player, targetRoom);
+    return {
+      moveId: generatedMoveId,
+      transactionId: moveId,
+      playerId: player.id,
+      playerUuid: player.uuid?.toString?.(),
+      playerLevelId: player.levelId,
+      targetRoomId: targetRoom.id,
+      targetAddress: targetRoom.address?.toApi?.() ?? targetRoom.address,
+      moveNonce: this.createMoveNonce(player, targetRoom),
+      splitType: 0,
+      status: 'pending',
+      createdAt: Date.now()
+    };
+  }
+
   moveLevel(levelId, targetRoom) {
-    const players = this.players.listInLevel(Number(levelId));
+    const players = typeof this.players.listActiveInLevel === 'function'
+      ? this.players.listActiveInLevel(Number(levelId))
+      : this.players.listInLevel(Number(levelId));
     let moved = 0;
 
     for (const player of players) {
@@ -78,6 +183,10 @@ export class MoveService {
         reason
       }
     });
+    if (player.session.state === ConnectionState.MOVING) {
+      player.session.transition(ConnectionState.ACTIVE);
+      this.levelService?.rebalanceAuthority(player.levelId);
+    }
 
     for (const [moveId, move] of this.pendingMoves.entries()) {
       if (move.playerId === player.id) {
@@ -112,6 +221,11 @@ export class MoveService {
       };
       this.pendingMoves.delete(matched.moveId);
       this.moveHistory.set(matched.moveId, updated);
+      if (result !== 0 && session.state === ConnectionState.MOVING) {
+        session.transition(ConnectionState.ACTIVE);
+        this.levelService?.rebalanceAuthority(player.levelId);
+      }
+      this.onMoveResult?.({ ...matched, result }, result === 0);
     }
 
     this.logger.debug({
@@ -119,6 +233,23 @@ export class MoveService {
       result,
       payloadBytes: payload.payloadBytes?.length ?? 0
     }, 'received move result');
+  }
+
+  forgetPlayerMoves(player, reason = 'player_disconnected') {
+    if (!player) return 0;
+    let removed = 0;
+    for (const [moveId, move] of this.pendingMoves.entries()) {
+      if (move.playerId !== player.id) continue;
+      this.pendingMoves.delete(moveId);
+      this.moveHistory.set(moveId, {
+        ...move,
+        status: 'aborted',
+        abortReason: reason,
+        abortedAt: Date.now()
+      });
+      removed += 1;
+    }
+    return removed;
   }
 
   createMoveId(player, targetRoom) {

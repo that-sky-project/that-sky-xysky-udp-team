@@ -1,4 +1,22 @@
+import { StateError } from '../utils/errors.js';
+
 let nextSessionId = 1;
+
+export const ConnectionState = Object.freeze({
+  CONNECTED: 'CONNECTED',
+  PENDING: 'PENDING',
+  ACTIVE: 'ACTIVE',
+  MOVING: 'MOVING',
+  CLOSED: 'CLOSED'
+});
+
+const TRANSITIONS = Object.freeze({
+  [ConnectionState.CONNECTED]: new Set([ConnectionState.PENDING, ConnectionState.CLOSED]),
+  [ConnectionState.PENDING]: new Set([ConnectionState.ACTIVE, ConnectionState.CLOSED]),
+  [ConnectionState.ACTIVE]: new Set([ConnectionState.MOVING, ConnectionState.CLOSED]),
+  [ConnectionState.MOVING]: new Set([ConnectionState.ACTIVE, ConnectionState.CLOSED]),
+  [ConnectionState.CLOSED]: new Set()
+});
 
 export class ConnectionSession {
   constructor({ peerId, roomId }) {
@@ -8,10 +26,12 @@ export class ConnectionSession {
     this.connectedAt = Date.now();
     this.lastPacketAt = this.connectedAt;
     this.player = null;
+    this.state = ConnectionState.CONNECTED;
     this.closed = false;
     this.badPackets = 0;
     this._sessionSeq = 0;
     this._packetSeq = new Map();
+    this.connMagic = null;
   }
 
   /**
@@ -34,8 +54,38 @@ export class ConnectionSession {
     this.player = player;
   }
 
+  transition(nextState) {
+    if (nextState === this.state) {
+      return this.state;
+    }
+    if (!TRANSITIONS[this.state]?.has(nextState)) {
+      throw new StateError('invalid connection state transition', {
+        sessionId: this.id,
+        from: this.state,
+        to: nextState
+      });
+    }
+    this.state = nextState;
+    this.closed = nextState === ConnectionState.CLOSED;
+    return this.state;
+  }
+
+  is(state) {
+    return this.state === state;
+  }
+
+  isActive() {
+    return this.state === ConnectionState.ACTIVE;
+  }
+
+  isPlayerSession() {
+    return this.state === ConnectionState.ACTIVE || this.state === ConnectionState.MOVING;
+  }
+
   close() {
-    this.closed = true;
+    if (this.state !== ConnectionState.CLOSED) {
+      this.transition(ConnectionState.CLOSED);
+    }
   }
 
   registerBadPacket() {
@@ -48,6 +98,7 @@ export class ConnectionSession {
       id: this.id,
       roomId: this.roomId,
       peerId: this.peerId.toString(),
+      state: this.state,
       connectedAt: this.connectedAt,
       lastPacketAt: this.lastPacketAt,
       playerId: this.player?.id,

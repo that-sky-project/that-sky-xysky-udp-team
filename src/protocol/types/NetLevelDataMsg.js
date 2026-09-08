@@ -1,10 +1,7 @@
 import { BinaryReader } from '../binary/BinaryReader.js';
 import { BinaryWriter } from '../binary/BinaryWriter.js';
-import { SNAPSHOT_MAX_DATA_BYTES } from '../snapshot/constants.js';
+import { NET_LEVEL_DATA_MAX_BYTES } from '../snapshot/constants.js';
 import { ProtocolError } from '../../utils/errors.js';
-
-export const NET_LEVEL_DATA_HEADER_BYTES = 22;
-export const MAX_LEVEL_DATA_PAYLOAD_BYTES = SNAPSHOT_MAX_DATA_BYTES - NET_LEVEL_DATA_HEADER_BYTES;
 
 export function decodeNetLevelDataMsg(buffer, options = {}) {
   const reader = buffer instanceof BinaryReader ? buffer : new BinaryReader(buffer);
@@ -17,7 +14,7 @@ export function decodeNetLevelDataMsg(buffer, options = {}) {
   const electedPlayer = reader.readUInt8();
   const levelId = reader.readUInt32();
   const unknown1 = reader.readUInt16();
-  const hasInitialDataRaw = reader.readUInt8();
+  const hasInitialData = reader.readBool();
   const netLevelData = readNetLevelData(reader, options);
   const remaining = reader.remaining;
 
@@ -25,8 +22,7 @@ export function decodeNetLevelDataMsg(buffer, options = {}) {
     electedPlayer,
     levelId,
     unknown1,
-    hasInitialData: hasInitialDataRaw !== 0,
-    hasInitialDataRaw,
+    hasInitialData,
     ...netLevelData,
     trailingBytes: remaining
   };
@@ -40,46 +36,35 @@ export function encodeNetLevelDataMsg({
   unknown1 = 0,
   unknown2 = 0,
   unknown3 = 0,
-  levelHash,
-  unknown4,
+  levelHash = 0,
+  unknown4 = levelHash,
   unknown5 = 0,
   unknown6 = 0,
-  hasInitialData = false,
-  hasInitialDataRaw
+  hasInitialData = false
 }) {
-  const data = Buffer.from(levelData);
-  if (data.length > MAX_LEVEL_DATA_PAYLOAD_BYTES) {
-    throw new ProtocolError('level data too large', {
-      dataLength: data.length,
-      max: MAX_LEVEL_DATA_PAYLOAD_BYTES
-    });
+  if (levelData.length > NET_LEVEL_DATA_MAX_BYTES) {
+    throw new ProtocolError('level data exceeds latest NetLevelData limit', { dataLength: levelData.length, max: NET_LEVEL_DATA_MAX_BYTES });
   }
-
-  const writer = new BinaryWriter(NET_LEVEL_DATA_HEADER_BYTES + data.length);
-  const wireLevelHash = levelHash ?? unknown4 ?? 0;
-  const wireHasInitialData = hasInitialDataRaw ?? (hasInitialData ? 1 : 0);
+  const writer = new BinaryWriter(64 + levelData.length);
 
   writer.writeUInt8(electedPlayer);
   writer.writeUInt32(levelId);
   writer.writeUInt16(unknown1);
-  writer.writeUInt8(wireHasInitialData);
+  writer.writeBool(hasInitialData);
   writer.writeUInt16(unknown2);
   writer.writeUInt8(unknown3);
-  writer.writeUInt32(wireLevelHash);
+  writer.writeUInt32(unknown4);
   writer.writeUInt8(mergeState);
   writer.writeUInt16(unknown5);
   writer.writeUInt16(unknown6);
-  writer.writeUInt16(data.length);
-  writer.writeBytes(data);
+  writer.writeUInt16(levelData.length);
+  writer.writeBytes(levelData);
 
   return writer.toBuffer();
 }
 
 export function readNetLevelData(reader, options = {}) {
-  const maxDataBytes = Math.min(
-    options.maxDataBytes ?? MAX_LEVEL_DATA_PAYLOAD_BYTES,
-    MAX_LEVEL_DATA_PAYLOAD_BYTES
-  );
+  const { maxDataBytes = NET_LEVEL_DATA_MAX_BYTES } = options;
 
   const unknown2 = reader.readUInt16();
   const unknown3 = reader.readUInt8();
@@ -111,29 +96,36 @@ export function readNetLevelData(reader, options = {}) {
 export function writeNetLevelData(writer, {
   unknown2 = 0,
   unknown3 = 0,
-  levelHash,
-  unknown4,
+  levelHash = 0,
+  unknown4 = levelHash,
   mergeState = 0,
   unknown5 = 0,
   unknown6 = 0,
+  dataLength,
   levelData = Buffer.alloc(0)
 }) {
-  const data = Buffer.from(levelData);
-  if (data.length > MAX_LEVEL_DATA_PAYLOAD_BYTES) {
-    throw new ProtocolError('level data too large', {
-      dataLength: data.length,
-      max: MAX_LEVEL_DATA_PAYLOAD_BYTES
-    });
-  }
-
   writer.writeUInt16(unknown2);
   writer.writeUInt8(unknown3);
-  writer.writeUInt32(levelHash ?? unknown4 ?? 0);
+  writer.writeUInt32(unknown4);
   writeNetLevelMergeState(writer, mergeState);
   writer.writeUInt16(unknown5);
   writer.writeUInt16(unknown6);
-  writer.writeUInt16(data.length);
-  writer.writeBytes(data);
+  // The wire length describes the bytes that follow the header.  Derive it
+  // from the actual buffer, as the Rust LevelData serializer does; accepting
+  // a stale/default length creates an undecodable message with trailing or
+  // missing bytes.
+  const actualLength = levelData.length;
+  if (actualLength > NET_LEVEL_DATA_MAX_BYTES) {
+    throw new ProtocolError('level data length exceeds latest NetLevelData limit', { dataLength: actualLength, max: NET_LEVEL_DATA_MAX_BYTES });
+  }
+  if (dataLength !== undefined && dataLength !== actualLength) {
+    throw new ProtocolError('level data length mismatch', {
+      dataLength,
+      actualLength
+    });
+  }
+  writer.writeUInt16(actualLength);
+  writer.writeBytes(levelData);
 }
 
 export function readNetLevelMergeState(reader) {

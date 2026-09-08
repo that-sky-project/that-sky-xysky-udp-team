@@ -12,7 +12,7 @@ export class LevelUpdatePacket {
       levelStatus: reader.readUInt8(),
       levelId: reader.readUInt32(),
       levelSummary: reader.readBytes(64),
-      trailingState: reader.readUInt8()
+      trailingState: reader.readBool()
     };
   }
 
@@ -25,6 +25,6 @@ export class LevelUpdatePacket {
     writer.writeUInt8(packet.levelStatus ?? packet.unknown2 ?? 0);
     writer.writeUInt32(packet.levelId);
     writer.writeBytes(packet.levelSummary ?? packet.unknown3 ?? Buffer.alloc(64));
-    writer.writeUInt8(packet.trailingState ?? packet.unknown4 ?? 0);
+    writer.writeBool(packet.trailingState ?? packet.unknown4 ?? false);
   }
 }

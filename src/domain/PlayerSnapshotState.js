@@ -1,9 +1,12 @@
 import { SnapshotReader } from '../protocol/snapshot/SnapshotReader.js';
 import { SnapshotWriter } from '../protocol/snapshot/SnapshotWriter.js';
+import { decodePlayerState } from '../protocol/types/PlayerState.js';
 
 export class PlayerSnapshotState {
-  constructor() {
+  constructor({ decodeFields = false } = {}) {
+    this.decodeFields = decodeFields;
     this.rawState = null;
+    this.decodedState = null;
     this.readAckSequence = undefined;
     this.stats = {
       lastReadAt: undefined,
@@ -36,8 +39,22 @@ export class PlayerSnapshotState {
     this.stats.lastReadPayloadBytes = payload?.length ?? 0;
     this.stats.lastReadDataBytes = result.ok ? result.data.length : 0;
     this.stats.lastReadError = result.ok ? undefined : result.reason;
+    if (!result.ok && result.reason === 'missing_base') {
+      this.rawState = null;
+      this.readAckSequence = undefined;
+    }
     if (result.ok) {
       this.rawState = result.data;
+      if (this.decodeFields) {
+        try {
+          this.decodedState = decodePlayerState(result.data);
+        } catch {
+          // Keep the raw state available for the size check and opaque relay.
+          this.decodedState = null;
+        }
+      } else {
+        this.decodedState = null;
+      }
       if (result.ack) {
         this.readAckSequence = result.ack;
       }
@@ -52,6 +69,8 @@ export class PlayerSnapshotState {
       return undefined;
     }
 
+    // Writer returns a Buffer: [save_seq, base_seq, checksum, ...payload]
+    // Unpack into the object form expected by GameMessageService.
     const frame = {
       sequence: frameBuf[0],
       base:     frameBuf[1],
@@ -88,6 +107,7 @@ export class PlayerSnapshotState {
     this.stats.lastWriteStatus = 'reset';
     this.stats.droppedWrites = 0;
     this.rawState = null;
+    this.decodedState = null;
     this.readAckSequence = undefined;
     this._initReaderWriter();
   }

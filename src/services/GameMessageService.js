@@ -1,11 +1,10 @@
 import { PacketIds } from '../protocol/PacketIds.js';
 import { GameMsgType } from '../protocol/packets/shared/GameMsgPacket.js';
-import {
-  decodeNetLevelDataMsg,
-  encodeNetLevelDataMsg,
-  MAX_LEVEL_DATA_PAYLOAD_BYTES
-} from '../protocol/types/NetLevelDataMsg.js';
+import { decodeNetLevelDataMsg, encodeNetLevelDataMsg } from '../protocol/types/NetLevelDataMsg.js';
+import { decodePlayerState, encodePlayerState } from '../protocol/types/PlayerState.js';
+import { NET_LEVEL_DATA_MAX_BYTES, PLAYER_STATE_MAX_BYTES, SNAPSHOT_MAX_DATA_BYTES } from '../protocol/snapshot/constants.js';
 import { BinaryWriter } from '../protocol/binary/BinaryWriter.js';
+import { SnapshotWriter } from '../protocol/snapshot/SnapshotWriter.js';
 import { netRpcRouter } from '../protocol/packets/shared/netRpc/index.js';
 
 export class GameMessageService {
@@ -31,8 +30,21 @@ export class GameMessageService {
       return;
     }
 
-    source.lvSeq = payload.levelChangeCount & 0xff;
-    source.levelChangeCount = source.lvSeq;
+    // Some GameMsg variants do not carry a level generation in older clients.
+    // Do not turn an omitted field into generation zero.  When present, keep
+    // the wire's u8 semantics while rejecting non-numeric values.
+    if (typeof payload.levelChangeCount === 'number' && Number.isFinite(payload.levelChangeCount)) {
+      const incomingLvSeq = Math.trunc(payload.levelChangeCount) & 0xff;
+      if (incomingLvSeq !== source.lvSeq) {
+        this.logger.debug?.({
+          playerId: source.id,
+          expectedLevelChangeCount: source.lvSeq,
+          receivedLevelChangeCount: incomingLvSeq,
+          type: payload.type
+        }, 'ignored GameMsg with stale level generation');
+        return;
+      }
+    }
     source.touch();
 
     if (payload.type === GameMsgType.NetRpc) {
@@ -53,9 +65,7 @@ export class GameMessageService {
 
     if (
       payload.type === GameMsgType.Critters ||
-      payload.type === GameMsgType.Affinity ||
-      payload.type === GameMsgType.MusicSync ||
-      payload.type === GameMsgType.NetLevelElectionNominee
+      payload.type === GameMsgType.MusicSync
     ) {
       source.lastOpaqueGameMsg = {
         type: payload.type,
@@ -66,6 +76,39 @@ export class GameMessageService {
         ...payload,
         sourcePlayer: source.id
       });
+      return;
+    }
+
+    if (payload.type === GameMsgType.Affinity) {
+      source.lastAffinity = {
+        type: payload.type,
+        entries: payload.entries ?? [],
+        complete: payload.complete ?? false,
+        trailingBytes: payload.trailingBytes ?? 0,
+        bytes: payload.payloadBytes?.length ?? 0,
+        updatedAt: Date.now()
+      };
+      this.logger.debug?.({
+        playerId: source.id,
+        payloadBytes: payload.payloadBytes?.length ?? 0
+      }, 'consumed client affinity update');
+      return;
+    }
+
+    if (
+      payload.type === GameMsgType.Metrics ||
+      payload.type === GameMsgType.AudienceHint ||
+      payload.type === GameMsgType.AudienceSocialBroadcast ||
+      payload.type === GameMsgType.AudienceConsensusVote ||
+      payload.type === GameMsgType.AudienceChat ||
+      payload.type === GameMsgType.LevelStateSideChannel ||
+      payload.type === GameMsgType.AudienceSpotlightRequest
+    ) {
+      source.lastClientOnlyGameMsg = {
+        type: payload.type,
+        bytes: payload.payloadBytes?.length ?? 0,
+        updatedAt: Date.now()
+      };
       return;
     }
 
@@ -83,6 +126,38 @@ export class GameMessageService {
       }, '[SNAP]');
       if (!decoded.ok) {
         return;
+      }
+      if (decoded.data.length > PLAYER_STATE_MAX_BYTES) {
+        this.warn({ playerId: source.id, stateBytes: decoded.data.length, max: PLAYER_STATE_MAX_BYTES }, 'ignored oversized PlayerState');
+        source.playerDelta.rawState = null;
+        return;
+      }
+      // Client -> server snapshots contain only PlayerState. The sender is
+      // identified by the connection. Server -> client snapshots prepend the
+      // remote PlayerId in syncPlayerStates(), as required by the client reader.
+      source.playerDelta.rawState = decoded.data;
+      try {
+        source.playerDelta.decodedState = decodePlayerState(decoded.data);
+        this.logger.debug?.({
+          playerId: source.id,
+          stateBytes: decoded.data.length,
+          stateBits: source.playerDelta.decodedState.bits,
+          stateKind: source.playerDelta.decodedState.fields.stateKind,
+          position: source.playerDelta.decodedState.fields.position
+        }, 'decoded PlayerState');
+      } catch (error) {
+        source.playerDelta.decodedState = null;
+        this.warn({
+          playerId: source.id,
+          stateBytes: decoded.data.length,
+          statePrefixHex: decoded.data.subarray(0, 32).toString('hex'),
+          firstByteLow3: decoded.data[0] & 7,
+          snapshotSave: payload.snapshot?.sequence,
+          snapshotBase: payload.snapshot?.base,
+          snapshotRaw: decoded.raw,
+          error: error?.message,
+          details: error?.details
+        }, 'failed to decode PlayerState');
       }
       return;
     }
@@ -123,7 +198,7 @@ export class GameMessageService {
       try {
         levelDataMsg = decodeNetLevelDataMsg(decoded.data, {
           skipHeaderBytes: 0,
-          maxDataBytes: MAX_LEVEL_DATA_PAYLOAD_BYTES
+          maxDataBytes: NET_LEVEL_DATA_MAX_BYTES
         });
       } catch (error) {
         this.warn({
@@ -149,32 +224,31 @@ export class GameMessageService {
           }, 'received empty level data snapshot (all zeros)');
           return;
         }
-        this.warn({
-          playerId: source.id,
-          levelId: source.levelId,
-          packetLevelId: levelDataMsg.levelId,
-          electedPlayer: levelDataMsg.electedPlayer,
-          trailingBytes: levelDataMsg.trailingBytes,
-          dataLength: levelDataMsg.dataLength,
-          levelHash: levelDataMsg.levelHash
-        }, 'ignored level data stream with trailing bytes');
+        // this.warn({
+        //   playerId: source.id,
+        //   levelId: source.levelId,
+        //   packetLevelId: levelDataMsg.levelId,
+        //   electedPlayer: levelDataMsg.electedPlayer,
+        //   trailingBytes: levelDataMsg.trailingBytes,
+        //   dataLength: levelDataMsg.dataLength,
+        //   levelHash: levelDataMsg.levelHash
+        // }, 'ignored level data stream with trailing bytes');
         return;
       }
 
+      // The snapshot carries its own level id.  Do not let a stale packet from
+      // a previous level overwrite the authority cache for the sender's
+      // current level.
       if (levelDataMsg.levelId !== source.levelId) {
         this.warn({
           playerId: source.id,
-          playerLevelId: source.levelId,
+          sourceLevelId: source.levelId,
           packetLevelId: levelDataMsg.levelId
-        }, 'ignored level data for non-current level');
+        }, 'ignored level data for mismatched level');
         return;
       }
-
       const levelId = source.levelId;
       this.levels.saveLevelData(levelId, {
-        levelId: levelDataMsg.levelId,
-        hasInitialData: levelDataMsg.hasInitialData,
-        hasInitialDataRaw: levelDataMsg.hasInitialDataRaw,
         mergeState: levelDataMsg.mergeState ?? 0,
         unknown1: levelDataMsg.unknown1 ?? 0,
         unknown2: levelDataMsg.unknown2 ?? 0,
@@ -200,10 +274,7 @@ export class GameMessageService {
     }
 
     if (payload.type === GameMsgType.NetLevelDataElect) {
-      this.forwardToLevel(source, session, {
-        ...payload,
-        sourcePlayer: source.id
-      });
+      this.warn({ playerId: source.id }, 'ignored server-only NetLevelDataElect from client');
       return;
     }
 
@@ -218,22 +289,48 @@ export class GameMessageService {
       }
 
       if (!this.levels.getAuthority(source.levelId)) {
-        this.levels.setAuthority(source.levelId, source, { reason: 'heartbeat_no_authority' });
+        const players = this.activeInLevel(source.levelId);
+        const next = this.selectAuthorityCandidate(source.levelId, players);
+        if (next) {
+          this.levels.setAuthority(source.levelId, next, { reason: 'heartbeat_no_authority' });
+        }
       }
       return;
     }
 
     if (payload.type === GameMsgType.NetLevelDataRevoke) {
-      this.handleRevoke(source, session, payload);
+      this.penalizeAuthorityRevokeAttempt(source, payload);
       return;
     }
 
     if (payload.type === GameMsgType.NetLevelDataRevokeAck) {
+      source.lastRevokeAck = {
+        snapshot: payload.snapshot,
+        bytes: payload.payload?.length ?? 0,
+        updatedAt: Date.now()
+      };
       this.logger.debug({
         playerId: source.id,
         snapshot: payload.snapshot,
-        payloadBytes: payload.payloadBytes?.length ?? 0
+        payloadBytes: payload.payload?.length ?? 0
       }, 'received level data revoke ack');
+      return;
+    }
+
+    if (payload.type === GameMsgType.NetLevelElectionNominee) {
+      if (payload.levelId !== source.levelId) {
+        this.logger.debug?.({
+          playerId: source.id,
+          playerLevelId: source.levelId,
+          nomineeLevelId: payload.levelId
+        }, 'ignored election nominee for non-current level');
+        return;
+      }
+      source.lastElectionNominee = {
+        levelId: payload.levelId,
+        reason: payload.reason,
+        updatedAt: Date.now()
+      };
       return;
     }
 
@@ -248,51 +345,53 @@ export class GameMessageService {
     }
   }
 
-  handleRevoke(source, sourceSession, payload) {
-    const levelId = payload.levelId ?? source.levelId;
-    if (levelId !== source.levelId) {
+  penalizeAuthorityRevokeAttempt(source, payload) {
+    const levelId = source.levelId;
+    if (!this.levels.isAuthority(source, levelId)) {
       this.warn({
         playerId: source.id,
-        playerLevelId: source.levelId,
-        packetLevelId: levelId
-      }, 'ignored level revoke for non-current level');
-      return;
-    }
-
-    const authority = this.levels.getAuthority(levelId);
-    const levelPlayers = this.players.listInLevel(levelId);
-
-    if (authority && authority !== source) {
-      this.logger.debug({
-        sourcePlayerId: source.id,
         levelId,
-        authorityPlayerId: authority.id
-      }, 'ignored revoke from non-authority player');
-      this.sendRevokeAck(source, authority, levelId);
+        authorityPlayerId: this.levels.getAuthority(levelId)?.id
+      }, 'ignored NetLevelDataRevoke from non-authority player');
       return;
     }
 
-    this.levels.revokeAuthority(levelId, { reason: 'client_revoke' });
-    const next = levelPlayers.find(player => player !== source);
+    const levelPlayers = this.activeInLevel(levelId);
+    this.levels.penalizeAuthorityCandidate(levelId, source);
+
+    for (const target of levelPlayers) {
+      this.sendRevoke(target, source, levelId, payload.reason ?? 0);
+    }
+
+    this.levels.revokeAuthority(levelId, { reason: 'authority_revoke_penalty' });
+    const next = this.selectAuthorityCandidate(levelId, levelPlayers);
 
     if (next) {
       this.levels.setAuthority(levelId, next, {
         previousAuthorityPlayerId: source.id,
-        reason: 'client_revoke_migration'
+        reason: next === source ? 'sole_player_penalty_cleared' : 'authority_revoke_penalty'
       });
-    } else {
-      this.logger.debug({
-        levelId,
-        playerId: source.id
-      }, 'retained level data after sole player revoked authority');
     }
-
-    this.sendRevokeAck(source, next ?? source, levelId);
   }
 
+  selectAuthorityCandidate(levelId, players) {
+    this.levels.pruneAuthorityCandidatePenalties?.(levelId, players);
+    let next = players.find(player => !this.levels.isAuthorityCandidatePenalized?.(levelId, player));
+    if (!next && players.length === 1) {
+      next = players[0];
+      this.levels.clearAuthorityPenalty?.(levelId, next);
+    }
+    return next;
+  }
+
+  // Called by RoomServer when the server forcefully revokes a level's authority.
+  // Sends Revoke immediately followed by Elect to each player so the client resets
+  // its snapshot Reader before the new Elect keyframe arrives — guaranteed ordering
+  // within a single TCP/reliable-UDP connection.
   sendRevokeAndElect(levelId, revokedAuthority, nextAuthority, initialData, reason = 0) {
-    const levelPlayers = this.players.listInLevel(levelId);
+    const levelPlayers = this.activeInLevel(levelId);
     for (const target of levelPlayers) {
+      // 1. Revoke — client resets levelDelta Reader
       this.broadcaster.send(target.session, {
         id: PacketIds.GameMsg,
         payload: {
@@ -300,9 +399,10 @@ export class GameMessageService {
           levelChangeCount: target.lvSeq,
           sourcePlayer: revokedAuthority?.id ?? 0,
           playerId: revokedAuthority?.id ?? 0,
-          levelId
+          reason
         }
       });
+      // 2. Elect immediately after — client processes with a fresh Reader state
       if (nextAuthority) {
         this.sendElect(target, nextAuthority, initialData);
       }
@@ -317,54 +417,27 @@ export class GameMessageService {
         levelChangeCount: target.lvSeq,
         sourcePlayer: authority?.id ?? 0,
         playerId: authority?.id ?? 0,
-        levelId
-      }
-    });
-  }
-
-  sendRevokeAck(target, authority, levelId) {
-    const levelPayload = this.createLevelElectPayload(authority ?? target, this.levels.loadLevelData(levelId));
-    const frame = target.levelDelta.write(levelPayload);
-
-    if (!frame) {
-      this.logger.debug({
-        playerId: target.id,
-        levelId
-      }, 'skipped level data revoke ack because snapshot frame was too large');
-      return;
-    }
-
-    this.broadcaster.send(target.session, {
-      id: PacketIds.GameMsg,
-      payload: {
-        type: GameMsgType.NetLevelDataRevokeAck,
-        levelChangeCount: target.lvSeq,
-        sourcePlayer: authority?.id ?? 0,
-        snapshot: {
-          sequence: frame.sequence,
-          base: frame.base,
-          checksum: frame.checksum
-        },
-        payload: frame.payload
+        reason
       }
     });
   }
 
   sendElect(target, authority, initialData = undefined) {
-    let cached = this.levels.loadLevelData(authority.levelId);
-    if (!cached) {
-      const initialPayload = Buffer.from(initialData?.payload ?? initialData?.levelData ?? Buffer.alloc(0));
-      cached = this.levels.saveLevelData(authority.levelId, {
-        ...(initialData ?? {}),
-        levelId: authority.levelId,
-        payload: initialPayload,
-        authorityPlayerId: authority.id
-      });
+    const levelPayload = this.createLevelElectPayload(authority, initialData);
+    if (levelPayload.length > SNAPSHOT_MAX_DATA_BYTES) {
+      this.warn({ targetPlayerId: target.id, levelId: authority?.levelId, dataBytes: levelPayload.length }, 'skipped oversized elect payload');
+      return;
     }
-
-    target.levelDelta.writer.forceKeyframe();
-    const levelPayload = this.createLevelElectPayload(authority, cached);
-    const frame = target.levelDelta.write(levelPayload);
+    // Elect is decoded by a temporary client reader initialized with the
+    // empty sequence-1 base. Keep the persistent NetLevelData stream intact.
+    const electWriter = new SnapshotWriter();
+    const frameBuffer = electWriter.write(levelPayload);
+    const frame = frameBuffer && {
+      sequence: frameBuffer[0],
+      base: frameBuffer[1],
+      checksum: frameBuffer[2],
+      payload: frameBuffer.subarray(3)
+    };
 
     if (!frame) {
       this.logger.debug({
@@ -401,11 +474,10 @@ export class GameMessageService {
         payload: frame.payload
       }
     });
-    target.clearLevelDataRevision?.();
   }
 
   forwardToLevel(source, sourceSession, payload) {
-    for (const target of this.players.listInLevel(source.levelId)) {
+    for (const target of this.activeInLevel(source.levelId)) {
       if (target === source || target.session === sourceSession) {
         continue;
       }
@@ -423,7 +495,7 @@ export class GameMessageService {
   }
 
   syncLevelData() {
-    for (const target of this.players.list()) {
+    for (const target of this.activePlayers()) {
       const levelId = target.levelId;
       if (levelId == null) continue;
 
@@ -433,18 +505,28 @@ export class GameMessageService {
 
       const levelData = this.levels.loadLevelData(levelId);
       if (!levelData) continue;
-      if (target.hasLevelDataRevision?.(levelId, levelData.revision)) continue;
 
       const outgoing = encodeNetLevelDataMsg({
         ...levelData,
         electedPlayer: authority.id,
-        levelId: levelData.levelId,
-        hasInitialData: levelData.hasInitialData,
+        levelId: authority.levelId,
+        hasInitialData: (levelData.payload?.length ?? 0) > 0,
         levelData: levelData.payload ?? Buffer.alloc(0)
       });
 
+      if (outgoing.length > SNAPSHOT_MAX_DATA_BYTES) continue;
       const frame = target.levelDelta.write(outgoing);
       if (!frame) continue;
+
+      this.logger.debug?.({
+        pkt: 'snap-out', dir: 'S->C', type: 'lev',
+        pid: target.id, levelId,
+        save_seq: frame.sequence,
+        base_seq: frame.base,
+        chk: frame.checksum,
+        payloadBytes: frame.payload.length,
+        dataBytes: outgoing.length
+      }, '[SNAP]');
 
       this.broadcaster.send(target.session, {
         id: PacketIds.GameMsg,
@@ -460,66 +542,146 @@ export class GameMessageService {
           payload: frame.payload
         }
       });
-      target.markLevelDataRevision?.(levelId, levelData.revision);
     }
   }
 
   syncPlayerStates() {
-    for (const target of this.players.list()) {
+    const activePlayers = this.activePlayers();
+    for (const target of activePlayers) {
       const levelId = target.levelId;
       if (levelId == null) continue;
 
-      const parts = [];
-      let totalBytes = 0;
+      let batch = [];
+      let batchBytes = 0;
+      const flush = () => {
+        if (batch.length === 0) return;
+        const writer = new BinaryWriter(batchBytes);
+        for (const { id, raw } of batch) {
+          writer.writeUInt8(id);
+          writer.writeUInt32(raw.length);
+          writer.writeBytes(raw);
+        }
+        const frame = target.playerDelta.write(writer.toBuffer());
+        if (frame) {
+          this.logger.debug?.({
+            pkt: 'snap-out', dir: 'S->C', type: 'pla',
+            pid: target.id,
+            save_seq: frame.sequence,
+            base_seq: frame.base,
+            chk: frame.checksum,
+            payloadBytes: frame.payload.length,
+            dataBytes: batchBytes,
+            players: batch.map(entry => entry.id)
+          }, '[SNAP]');
+          this.broadcaster.send(target.session, {
+            id: PacketIds.GameMsg,
+            payload: {
+              type: GameMsgType.PlayerStateDelta,
+              levelChangeCount: target.lvSeq,
+              sourcePlayer: 0,
+              snapshot: {
+                sequence: frame.sequence,
+                base: frame.base,
+                checksum: frame.checksum
+              },
+              payload: frame.payload
+            }
+          });
+        }
+        batch = [];
+        batchBytes = 0;
+      };
 
-      for (const peer of this.players.listInLevel(levelId)) {
+      for (const peer of activePlayers) {
         if (peer === target) continue;
-        const raw = peer.playerDelta.rawState;
+        let raw = peer.playerDelta.rawState;
+        if (peer.playerDelta.decodedState) {
+          try {
+            raw = encodePlayerState(peer.playerDelta.decodedState);
+          } catch (error) {
+            this.warn({
+              sourcePlayerId: peer.id,
+              targetPlayerId: target.id,
+              error: error?.message
+            }, 'PlayerState field serialization failed; relaying raw state');
+          }
+        }
         if (!raw || raw.length === 0) continue;
-        totalBytes += 1 + 4 + raw.length;
-        parts.push({ id: peer.id, raw });
+
+        const entryBytes = 1 + 4 + raw.length;
+        if (raw.length > PLAYER_STATE_MAX_BYTES || entryBytes > SNAPSHOT_MAX_DATA_BYTES) {
+          this.warn({ targetPlayerId: target.id, sourcePlayerId: peer.id, levelId, stateBytes: raw.length }, 'syncPlayerStates: dropped oversized player state');
+          continue;
+        }
+        if (batchBytes + entryBytes > SNAPSHOT_MAX_DATA_BYTES) flush();
+        batch.push({ id: peer.id, raw });
+        batchBytes += entryBytes;
+      }
+      flush();
+    }
+  }
+
+  forwardSnapshotToLevel(source, sourceSession, type, data, { levelId = source.levelId } = {}) {
+    let forwarded = 0;
+    let dropped = 0;
+
+    for (const target of this.activeInLevel(levelId)) {
+      if (target === source || target.session === sourceSession) {
+        continue;
       }
 
-      if (parts.length === 0) continue;
-
-      const writer = new BinaryWriter(totalBytes);
-      for (const { id, raw } of parts) {
-        writer.writeUInt8(id);
-        writer.writeUInt32(raw.length);
-        writer.writeBytes(raw);
+      const state = type === GameMsgType.PlayerStateDelta
+        ? target.playerDelta
+        : target.levelDelta;
+      if (data.length > SNAPSHOT_MAX_DATA_BYTES) {
+        dropped += 1;
+        continue;
       }
-      const aggregated = writer.toBuffer();
+      const frame = state.write(data);
 
-      const frame = target.playerDelta.write(aggregated);
       if (!frame) {
+        dropped += 1;
         this.warn({
+          sourcePlayerId: source.id,
           targetPlayerId: target.id,
           levelId,
-          peerCount: parts.length,
-          aggregatedBytes: totalBytes
-        }, 'syncPlayerStates: dropped frame too large');
+          type,
+          dataBytes: data?.length ?? 0
+        }, 'dropped snapshot forward because frame was too large');
         continue;
       }
 
       this.broadcaster.send(target.session, {
         id: PacketIds.GameMsg,
         payload: {
-          type: GameMsgType.PlayerStateDelta,
+          type,
           levelChangeCount: target.lvSeq,
-          sourcePlayer: 0,
+          sourcePlayer: source.id,
           snapshot: {
             sequence: frame.sequence,
-            base:     frame.base,
+            base: frame.base,
             checksum: frame.checksum
           },
           payload: frame.payload
         }
       });
+      forwarded += 1;
     }
+
+    if (type === GameMsgType.NetLevelData && forwarded === 0) {
+      this.logger.debug({
+        sourcePlayerId: source.id,
+        levelId,
+        playersInLevel: this.activeInLevel(levelId).map(player => player.id),
+        dropped
+      }, 'level data had no receiver in level');
+    }
+
+    return forwarded;
   }
 
   sendSnapshotAcks() {
-    for (const target of this.players.list()) {
+    for (const target of this.activePlayers()) {
       this.broadcaster.send(target.session, {
         id: PacketIds.GameMsg,
         payload: {
@@ -540,9 +702,23 @@ export class GameMessageService {
     return encodeNetLevelDataMsg({
       ...(cached ?? {}),
       electedPlayer: authority.id,
-      levelId: cached?.levelId ?? authority.levelId,
-      hasInitialData: cached?.hasInitialData ?? initialData?.hasInitialData ?? payload.length > 0,
+      levelId: authority.levelId,
+      hasInitialData: payload.length > 0,
       levelData: payload
     });
+  }
+
+  activePlayers() {
+    const players = typeof this.players.listActive === 'function'
+      ? this.players.listActive()
+      : this.players.list();
+    return players.filter(player => player.session?.isActive?.() ?? true);
+  }
+
+  activeInLevel(levelId) {
+    const players = typeof this.players.listActiveInLevel === 'function'
+      ? this.players.listActiveInLevel(levelId)
+      : this.players.listInLevel(levelId);
+    return players.filter(player => player.session?.isActive?.() ?? true);
   }
 }

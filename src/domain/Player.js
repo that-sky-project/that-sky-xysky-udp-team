@@ -1,55 +1,34 @@
 import { PlayerSnapshotState } from './PlayerSnapshotState.js';
 
 export class Player {
-  constructor({ id, uuid, session, levelId, netVersion }) {
+  constructor({ id, uuid, session, levelId, netVersion, levelChangeCount = 0 }) {
     this.id = id;
     this.uuid = uuid;
     this.session = session;
     this.levelId = levelId ?? 0;
     this.netVersion = netVersion;
-    this.lvSeq = 0;
-    this.levelChangeCount = 1;
+    this.lvSeq = Number.isFinite(levelChangeCount) ? (Math.trunc(levelChangeCount) & 0xff) : 0;
+    this.levelChangeCount = this.lvSeq;
     this.joinedAt = Date.now();
     this.lastSeenAt = Date.now();
+    // PlayerState decoding belongs in GameMessageService after the snapshot
+    // body has been reconstructed and its native 0x4b5 limit checked.
     this.playerDelta = new PlayerSnapshotState();
     this.levelDelta = new PlayerSnapshotState();
-    this.lastLevelDataLevelId = undefined;
-    this.lastLevelDataRevision = undefined;
   }
 
   touch(now = Date.now()) {
     this.lastSeenAt = now;
   }
 
-  changeLevel(levelId, netVersion = this.netVersion) {
-    const oldLevelId = this.levelId;
+  changeLevel(levelId, netVersion = this.netVersion, levelChangeCount = undefined) {
     this.levelId = levelId;
-    this.lvSeq = (this.lvSeq + 1) & 0xff;
+    this.lvSeq = Number.isFinite(levelChangeCount)
+      ? (Math.trunc(levelChangeCount) & 0xff)
+      : ((this.lvSeq + 1) & 0xff);
     this.levelChangeCount = this.lvSeq;
     this.netVersion = netVersion;
-    if (oldLevelId !== levelId) {
-      this.levelDelta.reset();
-      this.lastLevelDataLevelId = undefined;
-      this.lastLevelDataRevision = undefined;
-    }
     this.touch();
-  }
-
-  hasLevelDataRevision(levelId, revision) {
-    return this.lastLevelDataLevelId === levelId && this.lastLevelDataRevision === revision;
-  }
-
-  markLevelDataRevision(levelId, revision) {
-    if (revision === undefined) {
-      return;
-    }
-    this.lastLevelDataLevelId = levelId;
-    this.lastLevelDataRevision = revision;
-  }
-
-  clearLevelDataRevision() {
-    this.lastLevelDataLevelId = undefined;
-    this.lastLevelDataRevision = undefined;
   }
 
   toApi() {
@@ -66,7 +45,6 @@ export class Player {
       lastSeenAt: this.lastSeenAt,
       lastRpc: this.lastRpc,
       lastOpaqueGameMsg: this.lastOpaqueGameMsg,
-      lastLevelDataRevision: this.lastLevelDataRevision,
       snapshots: {
         player: this.playerDelta.toApi(),
         level: this.levelDelta.toApi()

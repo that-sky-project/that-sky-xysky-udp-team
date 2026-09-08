@@ -1,4 +1,7 @@
 import { PacketIds } from '../../PacketIds.js';
+import { ProtocolError } from '../../../utils/errors.js';
+
+const MAX_ENTER_GAME_PLAYERS = 8;
 
 export class EnterGamePacket {
   static id = PacketIds.EnterGame;
@@ -16,12 +19,17 @@ export class EnterGamePacket {
   static encode(writer, packet) {
     const players = packet.players ?? [];
 
-    // compressed int 0..8: values 0–127 fit in a single byte (MSB = 0).
-    writer.writeUInt8(players.length & 0x7f);
+    // SerializeCompressed(0, 8) uses four LSB-first bits; the next byte field aligns.
+    if (players.length > MAX_ENTER_GAME_PLAYERS) {
+      throw new ProtocolError('EnterGame player list too large', {
+        count: players.length,
+        max: MAX_ENTER_GAME_PLAYERS
+      });
+    }
+    writer.writeCompressed(players.length, MAX_ENTER_GAME_PLAYERS);
 
     for (const player of players) {
-      // net_player_id byte — the player's assigned ID (0-based, matching
-      // client-side NetPlayerBarn session_id counter).
+      // Zero is reserved for an unassigned player.
       writer.writeUInt8(player.netId ?? player.id ?? 0);
       // 16-byte player UUID
       player.uuid.encode(writer);

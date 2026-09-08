@@ -1,20 +1,34 @@
 import { PacketIds } from '../../PacketIds.js';
+import { decodeAffinityEntries, encodeAffinityEntries } from '../../types/Affinity.js';
 import { decodeMusicSyncEntries } from '../../types/MusicSync.js';
 
 export const GameMsgType = Object.freeze({
   NetRpc: 2,
   PlayerStateDelta: 3,
+  // Type 4 = Critters (S→C), forwarded as-is to level peers.
   Critters: 4,
+  // Client-to-server only in the latest client.
   Affinity: 7,
+  // Server-to-client authority election snapshot.
   NetLevelDataElect: 8,
+  // Server authority revocation control; an authority upload is penalized.
   NetLevelDataRevoke: 9,
+  // Client-to-server final level snapshot after a revoke request.
   NetLevelDataRevokeAck: 10,
   NetLevelData: 11,
   NetLevelDataHeartbeat: 12,
   SnapshotAck: 14,
   MusicSync: 15,
+  // Metrics telemetry is client-to-server only in the latest client.
   Metrics: 16,
-  NetLevelElectionNominee: 17
+  NetLevelElectionNominee: 17,
+  // Audience messages below are client-to-server requests/telemetry.
+  AudienceHint: 19,
+  AudienceSocialBroadcast: 20,
+  AudienceConsensusVote: 21,
+  AudienceChat: 22,
+  LevelStateSideChannel: 23,
+  AudienceSpotlightRequest: 24
 });
 
 function readSnapshotPayload(reader) {
@@ -30,6 +44,8 @@ function readSnapshotPayload(reader) {
 
 function writeHeader(writer, packet) {
   writer.writeUInt8(packet.type);
+  // levelSeq (byte 1): the server-managed lv_seq of the target receiver.
+  // Callers must set levelChangeCount = target.lvSeq before encoding.
   writer.writeUInt8(packet.levelChangeCount ?? 0);
   writer.writeUInt8(packet.sourcePlayer ?? 0);
 }
@@ -59,6 +75,15 @@ export class GameMsgPacket {
       };
     }
 
+    if (type === GameMsgType.Affinity) {
+      const raw = reader.readBytes(reader.remaining);
+      return {
+        ...base,
+        ...decodeAffinityEntries(raw),
+        payloadBytes: raw
+      };
+    }
+
     if (
       type === GameMsgType.PlayerStateDelta ||
       type === GameMsgType.NetLevelData ||
@@ -72,14 +97,12 @@ export class GameMsgPacket {
 
     if (type === GameMsgType.NetLevelDataRevoke) {
       const raw = reader.readBytes(reader.remaining);
-      const parsed = raw.length >= 5
+      const parsed = raw.length >= 3
         ? {
             playerId: raw.readUInt8(0),
-            levelId: raw.readUInt32LE(1)
+            reason: raw.readUInt16LE(1)
           }
-        : raw.length >= 1
-          ? { playerId: raw.readUInt8(0) }
-          : {};
+        : {};
 
       return {
         ...base,
@@ -98,7 +121,7 @@ export class GameMsgPacket {
     if (type === GameMsgType.NetLevelDataHeartbeat) {
       return {
         ...base,
-        ready: Boolean(reader.readUInt8()),
+        ready: reader.readBool(),
         netPlayerId: reader.readUInt8(),
         levelId: reader.readUInt32(),
         authorityVersion: reader.readUInt16()
@@ -106,6 +129,8 @@ export class GameMsgPacket {
     }
 
     if (type === GameMsgType.SnapshotAck) {
+      // Wire order matches Rust snapshot_ack(): [player_stat_ack, level_data_ack].
+      // payload[0] = player delta ack seq, payload[1] = level delta ack seq.
       return {
         ...base,
         playerAckSeq: reader.readUInt8(),
@@ -126,10 +151,10 @@ export class GameMsgPacket {
     }
 
     if (type === GameMsgType.NetLevelElectionNominee) {
-      if (reader.remaining >= 3) {
+      if (reader.remaining >= 6) {
         return {
           ...base,
-          playerId: reader.readUInt8(),
+          levelId: reader.readUInt32(),
           reason: reader.readUInt16()
         };
       }
@@ -155,6 +180,11 @@ export class GameMsgPacket {
       return;
     }
 
+    if (packet.type === GameMsgType.Affinity) {
+      writer.writeBytes(packet.payloadBytes ?? encodeAffinityEntries(packet.entries));
+      return;
+    }
+
     if (
       packet.type === GameMsgType.PlayerStateDelta ||
       packet.type === GameMsgType.NetLevelData ||
@@ -171,7 +201,7 @@ export class GameMsgPacket {
       }
 
       writer.writeUInt8(packet.playerId ?? packet.authorityPlayerId ?? 0);
-      writer.writeUInt32(packet.levelId ?? 0);
+      writer.writeUInt16(packet.reason ?? 0);
       return;
     }
 
@@ -181,7 +211,7 @@ export class GameMsgPacket {
     }
 
     if (packet.type === GameMsgType.NetLevelDataHeartbeat) {
-      writer.writeUInt8(packet.ready ? 1 : 0);
+      writer.writeBool(packet.ready);
       writer.writeUInt8(packet.netPlayerId ?? 0);
       writer.writeUInt32(packet.levelId ?? 0);
       writer.writeUInt16(packet.authorityVersion ?? packet.unknown3 ?? 0);
@@ -189,6 +219,7 @@ export class GameMsgPacket {
     }
 
     if (packet.type === GameMsgType.SnapshotAck) {
+      // Wire order matches Rust snapshot_ack(): [player_stat_ack, level_data_ack].
       writer.writeUInt8(packet.playerAckSeq ?? 0);
       writer.writeUInt8(packet.levelAckSeq ?? 0);
       return;
@@ -200,7 +231,7 @@ export class GameMsgPacket {
         return;
       }
 
-      writer.writeUInt8(packet.playerId ?? 0);
+      writer.writeUInt32(packet.levelId ?? packet.playerId ?? 0);
       writer.writeUInt16(packet.reason ?? 0);
       return;
     }

@@ -1,26 +1,34 @@
 import { PacketIds } from '../protocol/PacketIds.js';
+import { ConnectionState } from './ConnectionSession.js';
 
 export class PeerEventHandler {
-  constructor({ config, sessions, codec, dispatcher, players, levelService, broadcaster, transport, metrics, logger }) {
+  constructor({ config, sessions, codec, dispatcher, players, levelService, moveService, broadcaster, transport, metrics, logger, onPlayerLeft }) {
     this.config = config;
     this.sessions = sessions;
     this.codec = codec;
     this.dispatcher = dispatcher;
     this.players = players;
     this.levelService = levelService;
+    this.moveService = moveService;
     this.broadcaster = broadcaster;
     this.transport = transport;
     this.metrics = metrics;
     this.logger = logger;
+    this.onPlayerLeft = onPlayerLeft;
   }
 
   onConnect(peerId) {
+    if (this.sessions.get(peerId)) {
+      this.logger.warn({ peerId: peerId.toString() }, 'ignored duplicate peer connect event');
+      return;
+    }
     if (this.sessions.size >= this.config.maxPeers) {
       this.transport.disconnect(peerId, 'now');
       return;
     }
 
     const session = this.sessions.add(peerId);
+    session.transition(ConnectionState.PENDING);
 
     this.metrics.connectedPeers.set(this.sessions.size);
     this.logger.debug({ peerId: peerId.toString(), sessionId: session.id }, 'peer connected');
@@ -40,16 +48,9 @@ export class PeerEventHandler {
       return;
     }
 
+    let packet;
     try {
-      const packet = this.codec.decodeClient(data);
-      this.metrics.packets.inc({ direction: 'client', type: packet.name });
-      this._logClientPacket(session, peerId, channel, data, packet);
-      const endTimer = this.metrics.packetDuration.startTimer({ type: packet.name });
-      try {
-        this.dispatcher.dispatch(session, packet);
-      } finally {
-        endTimer();
-      }
+      packet = this.codec.decodeClient(data);
     } catch (error) {
       this._rejectSessionPacket(session, error.name ?? 'decode_error');
       this.logger.warn({
@@ -59,6 +60,42 @@ export class PeerEventHandler {
         channel,
         rawPacket: formatPacketBytes(data)
       }, 'failed to process packet');
+      return;
+    }
+
+    if (session.connMagic === null && packet.id !== PacketIds.JoinGame) {
+      this._rejectSessionPacket(session, 'join_required');
+      return;
+    }
+    if (session.connMagic === null) {
+      session.connMagic = packet.token;
+    } else if (packet.token !== session.connMagic) {
+      this._rejectSessionPacket(session, 'magic_mismatch');
+      this.logger.warn({
+        peerId: peerId.toString(),
+        sessionId: session.id,
+        expected: session.connMagic,
+        got: packet.token
+      }, 'rejected packet: connection magic mismatch');
+      return;
+    }
+
+    this.metrics.packets.inc({ direction: 'client', type: packet.name });
+    this._logClientPacket(session, peerId, channel, data, packet);
+    const endTimer = this.metrics.packetDuration.startTimer({ type: packet.name });
+    try {
+      this.dispatcher.dispatch(session, packet);
+    } catch (error) {
+      this._rejectSessionPacket(session, error.name ?? 'dispatch_error');
+      this.logger.warn({
+        err: error,
+        peerId: peerId.toString(),
+        sessionId: session.id,
+        channel,
+        rawPacket: formatPacketBytes(data)
+      }, 'failed to dispatch packet');
+    } finally {
+      endTimer();
     }
   }
 
@@ -70,6 +107,8 @@ export class PeerEventHandler {
 
     const player = this.players.removeBySession(session);
     if (player) {
+      this.onPlayerLeft?.(player);
+      this.moveService?.forgetPlayerMoves(player);
       this.levelService.releaseAuthority(player);
       this.broadcaster.broadcast({
         id: PacketIds.PlayerLeft,
@@ -81,7 +120,14 @@ export class PeerEventHandler {
     this.metrics.onlinePlayers.set(this.players.size);
     this.metrics.disconnects.inc({ reason: String(data ?? 'normal') });
 
-    this.logger.debug({ peerId: peerId.toString(), playerId: player?.id }, 'peer disconnected');
+    this.logger.info({
+      peerId: peerId.toString(),
+      sessionId: session.id,
+      playerId: player?.id,
+      uuid: player?.uuid?.toString?.(),
+      levelId: player?.levelId,
+      disconnectData: data
+    }, 'peer disconnected');
   }
 
   _logClientPacket(session, peerId, channel, data, packet) {
@@ -105,6 +151,7 @@ export class PeerEventHandler {
     this.metrics.packetErrors.inc({ reason });
 
     if (count >= this.config.badPacketLimit) {
+      session.close();
       this.metrics.disconnects.inc({ reason: 'bad_packet_limit' });
       this.transport.disconnect(session.peerId, 'later');
     }

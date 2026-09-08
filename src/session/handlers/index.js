@@ -4,8 +4,6 @@ import { handlePing } from './handlePing.js';
 import { handleLevelUpdate } from './handleLevelUpdate.js';
 import { handleGameMsg } from './handleGameMsg.js';
 import { handleMoveResult } from './handleMoveResult.js';
-import { handleCancelMove } from './handleCancelMove.js';
-import { handleDisconnect } from './handleDisconnect.js';
 
 export function registerAllHandlers(dispatcher) {
   dispatcher
@@ -13,7 +11,5 @@ export function registerAllHandlers(dispatcher) {
     .register(PacketIds.NetTimePing, handlePing)
     .register(PacketIds.LevelUpdate, handleLevelUpdate)
     .register(PacketIds.GameMsg,     handleGameMsg)
-    .register(PacketIds.MoveResult,  handleMoveResult)
-    .register(PacketIds.CancelMove,  handleCancelMove)
-    .register(PacketIds.Disconnect,  handleDisconnect);
+    .register(PacketIds.MoveResult,  handleMoveResult);
 }

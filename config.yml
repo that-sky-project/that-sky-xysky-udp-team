@@ -1,0 +1,23 @@
+env: development
+logging:
+  level: info
+  pretty: false
+
+room:
+  host: 0.0.0.0
+  port: 19133
+  # Public UDP endpoint reported to qwd. This is intentionally separate from host.
+  public_uri: 192.168.11.4:19133
+  max_peers: 64
+  channels: 2
+  tick_rate: 10
+  max_packet_bytes: 16384
+  bad_packet_limit: 8
+  move_targets: []
+
+http:
+  host: 0.0.0.0
+  port: 19133
+
+qwd:
+  url: wss://thatroom.thatskyproject.cc
